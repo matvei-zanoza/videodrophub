@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -46,6 +47,8 @@ USER_LOCKS: dict[int, asyncio.Lock] = {}
 CACHE_DIR: Path | None = None
 CACHE_TTL_SECONDS: int | None = None
 MAX_CACHE_FILES: int | None = None
+
+YTDLP_COOKIEFILE: Path | None = None
 
 DATA_DIR: Path | None = None
 DB_PATH: Path | None = None
@@ -234,6 +237,53 @@ def find_first_supported_url(text: str) -> str | None:
     return first.group(0)
 
 
+def _looks_like_youtube_cookie_error(message: str) -> bool:
+    m = message.lower()
+    return (
+        "confirm you’re not a bot" in m
+        or "confirm you're not a bot" in m
+        or "use --cookies" in m
+        or "cookies-from-browser" in m
+        or "sign in to confirm" in m
+    )
+
+
+def _has_ytdlp_cookies() -> bool:
+    return YTDLP_COOKIEFILE is not None and YTDLP_COOKIEFILE.exists()
+
+
+def _configure_ytdlp_cookies(data_dir: Path | None) -> Path | None:
+    cookie_file_env = os.getenv("YTDLP_COOKIE_FILE")
+    if cookie_file_env:
+        path = Path(cookie_file_env)
+        if path.exists():
+            return path
+
+    cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
+    if not cookies_b64:
+        return None
+
+    try:
+        raw = base64.b64decode(cookies_b64.encode("utf-8"), validate=True)
+    except Exception:
+        return None
+
+    if data_dir is None:
+        return None
+
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        out_path = data_dir / "youtube_cookies.txt"
+        out_path.write_bytes(raw)
+        try:
+            os.chmod(out_path, 0o600)
+        except Exception:
+            pass
+        return out_path
+    except Exception:
+        return None
+
+
 def _cache_key(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
 
@@ -340,6 +390,9 @@ def _download_tiktok_video_sync(url: str, out_dir: Path, filename_base: str | No
         "merge_output_format": "mp4",
         "format": "mp4/best",
     }
+
+    if YTDLP_COOKIEFILE is not None and YTDLP_COOKIEFILE.exists():
+        ydl_opts["cookiefile"] = str(YTDLP_COOKIEFILE)
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -478,6 +531,7 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"Ошибки: {summary.get('errors', 0)}\n"
                 f"Cache hit: {summary.get('cache_hit', 0)}\n"
                 f"Cache miss: {summary.get('cache_miss', 0)}\n"
+                f"YouTube cookies: {'ON' if _has_ytdlp_cookies() else 'OFF'}\n"
                 f"Техработы: {'ON' if MAINTENANCE_MODE else 'OFF'}"
             )
         await update.callback_query.edit_message_text(text, reply_markup=build_admin_keyboard())
@@ -657,10 +711,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 if DB_PATH is not None:
                     await asyncio.to_thread(db_inc_counter, "success", 1)
             except Exception as e:
+                err_text = str(e)
+                if YOUTUBE_SHORTS_URL_RE.search(url) and _looks_like_youtube_cookie_error(err_text):
+                    if _has_ytdlp_cookies():
+                        user_error = (
+                            "YouTube попросил подтверждение (анти-бот). "
+                            "Cookies уже подключены, но не помогли — нужно обновить cookies."
+                        )
+                    else:
+                        user_error = (
+                            "YouTube попросил подтверждение (анти-бот). "
+                            "Чтобы скачивание работало, админ должен подключить cookies для yt-dlp."
+                        )
+                else:
+                    user_error = f"Ошибка при скачивании: {e}"
+
                 try:
-                    await status.edit_text(f"Ошибка при скачивании: {e}")
+                    await status.edit_text(user_error)
                 except Exception:
-                    await update.message.reply_text(f"Ошибка при скачивании: {e}")
+                    await update.message.reply_text(user_error)
 
                 if DB_PATH is not None:
                     await asyncio.to_thread(db_inc_counter, "errors", 1)
@@ -701,6 +770,9 @@ def main() -> None:
     except Exception:
         DB_PATH = None
         MAINTENANCE_MODE = False
+
+    global YTDLP_COOKIEFILE
+    YTDLP_COOKIEFILE = _configure_ytdlp_cookies(DATA_DIR)
 
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
