@@ -32,6 +32,11 @@ TIKTOK_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+VK_CLIP_URL_RE = re.compile(
+    r"https?://(?:m\.)?vk\.com/(?:clip-?\d+_\d+|clips/[^\s]+|clip/[^\s]+)",
+    re.IGNORECASE,
+)
+
 YOUTUBE_SHORTS_URL_RE = re.compile(
     r"https?://(?:www\.)?youtube\.com/shorts/[A-Za-z0-9_-]+(?:\?[^\s]+)?",
     re.IGNORECASE,
@@ -84,6 +89,20 @@ def build_result_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Открыть бот", url=BOT_URL),
             ],
         ]
+    )
+
+
+def _looks_like_vk_auth_error(message: str) -> bool:
+    m = message.lower()
+    return (
+        "you have to log in" in m
+        or "login" in m
+        or "authorization" in m
+        or "access denied" in m
+        or "private" in m
+        or "forbidden" in m
+        or "http error 403" in m
+        or "http error 401" in m
     )
 
 
@@ -240,6 +259,9 @@ def find_first_supported_url(text: str) -> str | None:
     m1 = TIKTOK_URL_RE.search(text)
     if m1:
         matches.append(m1)
+    m_vk = VK_CLIP_URL_RE.search(text)
+    if m_vk:
+        matches.append(m_vk)
     m0 = DIRECT_VIDEO_URL_RE.search(text)
     if m0:
         matches.append(m0)
@@ -506,7 +528,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     start_text = (
         "Привет! 👋\n\n"
-        "Отправь ссылку на видео TikTok 🎬 — я скачаю и пришлю файл обратно.\n\n"
+        "Отправь ссылку на TikTok или VK Клипы 🎬 — я скачаю и пришлю файл обратно.\n\n"
         "Поддерживаю также прямые ссылки на видео/поток 🔗\n"
         ".mp4 / .webm / .m3u8 / .mpd\n\n"
         "Поделись ботом: @videodrophub_bot ✨"
@@ -514,7 +536,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if ENABLE_YOUTUBE:
         start_text = (
             "Привет! 👋\n\n"
-            "Отправь ссылку на TikTok или YouTube Shorts 🎬 — я скачаю и пришлю файл обратно.\n\n"
+            "Отправь ссылку на TikTok, VK Клипы или YouTube Shorts 🎬 — я скачаю и пришлю файл обратно.\n\n"
             "Поддерживаю также прямые ссылки на видео/поток 🔗\n"
             ".mp4 / .webm / .m3u8 / .mpd\n\n"
             "Поделись ботом: @videodrophub_bot ✨"
@@ -656,9 +678,9 @@ async def on_download_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await update.callback_query.answer()
     if update.effective_chat:
-        prompt = "Пришли новую ссылку на TikTok — я скачаю видео."
+        prompt = "Пришли новую ссылку на TikTok или VK Клипы — я скачаю видео."
         if ENABLE_YOUTUBE:
-            prompt = "Пришли новую ссылку на TikTok или YouTube Shorts — я скачаю видео."
+            prompt = "Пришли новую ссылку на TikTok, VK Клипы или YouTube Shorts — я скачаю видео."
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=prompt,
@@ -777,6 +799,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                             "YouTube попросил подтверждение (анти-бот). "
                             "Чтобы скачивание работало, админ должен подключить cookies для yt-dlp."
                         )
+                elif VK_CLIP_URL_RE.search(url) and _looks_like_vk_auth_error(err_text):
+                    user_error = (
+                        "VK ограничил доступ к этому клипу (возможна приватность/нужна авторизация). "
+                        "Попробуй другой клип или отправь прямую ссылку на .mp4/.m3u8."
+                    )
                 else:
                     user_error = f"Ошибка при скачивании: {e}"
 
