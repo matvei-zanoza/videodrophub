@@ -55,6 +55,8 @@ DB_PATH: Path | None = None
 ADMIN_IDS: set[int] = set()
 MAINTENANCE_MODE = False
 
+ENABLE_YOUTUBE = False
+
 
 def get_share_url() -> str:
     text = "Скачай видео из TikTok через бота"
@@ -228,13 +230,25 @@ def find_first_supported_url(text: str) -> str | None:
     m1 = TIKTOK_URL_RE.search(text)
     if m1:
         matches.append(m1)
-    m2 = YOUTUBE_SHORTS_URL_RE.search(text)
-    if m2:
-        matches.append(m2)
+    if ENABLE_YOUTUBE:
+        m2 = YOUTUBE_SHORTS_URL_RE.search(text)
+        if m2:
+            matches.append(m2)
     if not matches:
         return None
     first = min(matches, key=lambda m: m.start())
     return first.group(0)
+
+
+def _parse_bool(raw: str | None, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _looks_like_youtube_cookie_error(message: str) -> bool:
@@ -477,10 +491,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             update.effective_user.first_name,
             update.effective_user.last_name,
         )
-    await update.message.reply_text(
-        "Пришли ссылку на TikTok или YouTube Shorts — я попробую скачать и отправить файл обратно.",
-        parse_mode=ParseMode.HTML,
-    )
+    start_text = "Пришли ссылку на видео TikTok — я попробую скачать и отправить файл обратно."
+    if ENABLE_YOUTUBE:
+        start_text = "Пришли ссылку на TikTok или YouTube Shorts — я попробую скачать и отправить файл обратно."
+    await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
 
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -617,9 +631,12 @@ async def on_download_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await update.callback_query.answer()
     if update.effective_chat:
+        prompt = "Пришли новую ссылку на TikTok — я скачаю видео."
+        if ENABLE_YOUTUBE:
+            prompt = "Пришли новую ссылку на TikTok или YouTube Shorts — я скачаю видео."
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="Пришли новую ссылку на TikTok или YouTube Shorts — я скачаю видео.",
+            text=prompt,
         )
 
 
@@ -642,11 +659,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Рассылка завершена. OK: {ok}, FAIL: {failed}")
         return
 
+    if not ENABLE_YOUTUBE and YOUTUBE_SHORTS_URL_RE.search(update.message.text):
+        await update.message.reply_text("YouTube Shorts пока временно не поддерживаются. Пришли ссылку TikTok.")
+        return
+
     url = find_first_supported_url(update.message.text)
     if not url:
-        await update.message.reply_text(
-            "Не вижу ссылку TikTok или YouTube Shorts. Пришли, пожалуйста, ссылку на видео."
-        )
+        text = "Не вижу ссылку TikTok. Пришли, пожалуйста, ссылку на видео."
+        if ENABLE_YOUTUBE:
+            text = "Не вижу ссылку TikTok или YouTube Shorts. Пришли, пожалуйста, ссылку на видео."
+        await update.message.reply_text(text)
         return
 
     if not update.effective_user:
@@ -746,6 +768,9 @@ def main() -> None:
 
     global ADMIN_IDS
     ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS"))
+
+    global ENABLE_YOUTUBE
+    ENABLE_YOUTUBE = _parse_bool(os.getenv("ENABLE_YOUTUBE"), default=False)
 
     max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
     global GLOBAL_DOWNLOAD_SEMAPHORE
