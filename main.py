@@ -94,7 +94,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not video_path.exists():
             raise RuntimeError("Видео не удалось скачать: файл не найден")
 
-        caption = "Вот ваше видео!\n@videodrophub_bot"
+        caption = "Готово. Вот ваше видео!\nПоделись ботом: @videodrophub_bot"
 
         try:
             await update.message.reply_video(video=str(video_path), caption=caption)
