@@ -1,9 +1,11 @@
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import time
 import urllib.parse
@@ -12,6 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -39,6 +42,11 @@ CACHE_DIR: Path | None = None
 CACHE_TTL_SECONDS: int | None = None
 MAX_CACHE_FILES: int | None = None
 
+DATA_DIR: Path | None = None
+DB_PATH: Path | None = None
+ADMIN_IDS: set[int] = set()
+MAINTENANCE_MODE = False
+
 
 def get_share_url() -> str:
     text = "Скачай видео из TikTok через бота"
@@ -57,6 +65,154 @@ def build_result_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def build_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Статистика", callback_data="admin_stats"),
+                InlineKeyboardButton("Кэш", callback_data="admin_cache"),
+            ],
+            [
+                InlineKeyboardButton("Рассылка", callback_data="admin_broadcast"),
+                InlineKeyboardButton("Техработы", callback_data="admin_maintenance"),
+            ],
+            [InlineKeyboardButton("Закрыть", callback_data="admin_close")],
+        ]
+    )
+
+
+def _parse_admin_ids(raw: str | None) -> set[int]:
+    if not raw:
+        return set()
+    parts = [p.strip() for p in raw.split(",")]
+    out: set[int] = set()
+    for p in parts:
+        if not p:
+            continue
+        try:
+            out.add(int(p))
+        except ValueError:
+            continue
+    return out
+
+
+def is_admin(user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    return user_id in ADMIN_IDS
+
+
+def _db_connect() -> sqlite3.Connection:
+    if DB_PATH is None:
+        raise RuntimeError("DB not configured")
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def db_init() -> None:
+    if DB_PATH is None:
+        return
+    with contextlib.closing(_db_connect()) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS users ("
+            " user_id INTEGER PRIMARY KEY,"
+            " username TEXT,"
+            " first_name TEXT,"
+            " last_name TEXT,"
+            " first_seen_at REAL NOT NULL,"
+            " last_seen_at REAL NOT NULL"
+            ")"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS counters ("
+            " key TEXT PRIMARY KEY,"
+            " value INTEGER NOT NULL"
+            ")"
+        )
+        conn.commit()
+
+
+def db_set_counter(key: str, value: int) -> None:
+    with contextlib.closing(_db_connect()) as conn:
+        conn.execute(
+            "INSERT INTO counters(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        conn.commit()
+
+
+def db_get_counter(key: str, default: int = 0) -> int:
+    with contextlib.closing(_db_connect()) as conn:
+        cur = conn.execute("SELECT value FROM counters WHERE key=?", (key,))
+        row = cur.fetchone()
+        if not row:
+            return default
+        return int(row["value"])
+
+
+def db_inc_counter(key: str, delta: int = 1) -> None:
+    with contextlib.closing(_db_connect()) as conn:
+        conn.execute(
+            "INSERT INTO counters(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=value+excluded.value",
+            (key, delta),
+        )
+        conn.commit()
+
+
+def db_upsert_user(user_id: int, username: str | None, first_name: str | None, last_name: str | None) -> None:
+    now = time.time()
+    with contextlib.closing(_db_connect()) as conn:
+        conn.execute(
+            "INSERT INTO users(user_id, username, first_name, last_name, first_seen_at, last_seen_at) "
+            "VALUES(?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            " username=excluded.username,"
+            " first_name=excluded.first_name,"
+            " last_name=excluded.last_name,"
+            " last_seen_at=excluded.last_seen_at",
+            (user_id, username, first_name, last_name, now, now),
+        )
+        conn.commit()
+
+
+def db_list_user_ids() -> list[int]:
+    with contextlib.closing(_db_connect()) as conn:
+        cur = conn.execute("SELECT user_id FROM users")
+        return [int(r["user_id"]) for r in cur.fetchall()]
+
+
+def db_get_summary() -> dict[str, int]:
+    with contextlib.closing(_db_connect()) as conn:
+        cur = conn.execute("SELECT key, value FROM counters")
+        counters = {str(r["key"]): int(r["value"]) for r in cur.fetchall()}
+        cur2 = conn.execute("SELECT COUNT(*) AS c FROM users")
+        users_count = int(cur2.fetchone()["c"])
+    counters["users"] = users_count
+    return counters
+
+
+def get_cache_stats() -> tuple[int, int]:
+    if CACHE_DIR is None:
+        return 0, 0
+    try:
+        count = 0
+        total = 0
+        for p in CACHE_DIR.glob("*.mp4"):
+            try:
+                count += 1
+                total += p.stat().st_size
+            except Exception:
+                pass
+        return count, total
+    except Exception:
+        return 0, 0
 
 
 def _cache_key(url: str) -> str:
@@ -241,10 +397,146 @@ async def safe_cleanup(path: Path) -> None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    if update.effective_user and DB_PATH is not None:
+        await asyncio.to_thread(
+            db_upsert_user,
+            update.effective_user.id,
+            update.effective_user.username,
+            update.effective_user.first_name,
+            update.effective_user.last_name,
+        )
     await update.message.reply_text(
         "Пришли ссылку на видео TikTok — я попробую скачать и отправить файл обратно.",
         parse_mode=ParseMode.HTML,
     )
+
+
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    await update.message.reply_text(str(update.effective_user.id))
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Нет доступа")
+        return
+    await update.message.reply_text("Админ-панель", reply_markup=build_admin_keyboard())
+
+
+async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_admin(user_id):
+        await update.callback_query.answer("Нет доступа", show_alert=True)
+        return
+
+    data = update.callback_query.data or ""
+    await update.callback_query.answer()
+
+    global MAINTENANCE_MODE
+
+    if data == "admin_close":
+        try:
+            await update.callback_query.edit_message_text("Админ-панель закрыта")
+        except Exception:
+            pass
+        return
+
+    if data == "admin_stats":
+        if DB_PATH is None:
+            text = "DB не настроена"
+        else:
+            summary = await asyncio.to_thread(db_get_summary)
+            text = (
+                f"Пользователи: {summary.get('users', 0)}\n"
+                f"Запросы: {summary.get('requests', 0)}\n"
+                f"Успех: {summary.get('success', 0)}\n"
+                f"Ошибки: {summary.get('errors', 0)}\n"
+                f"Cache hit: {summary.get('cache_hit', 0)}\n"
+                f"Cache miss: {summary.get('cache_miss', 0)}\n"
+                f"Техработы: {'ON' if MAINTENANCE_MODE else 'OFF'}"
+            )
+        await update.callback_query.edit_message_text(text, reply_markup=build_admin_keyboard())
+        return
+
+    if data == "admin_cache":
+        count, size = await asyncio.to_thread(get_cache_stats)
+        size_mb = round(size / (1024 * 1024), 2)
+        ttl = CACHE_TTL_SECONDS or 0
+        max_files = MAX_CACHE_FILES or 0
+        text = (
+            f"Файлов в кэше: {count}\n"
+            f"Размер кэша: {size_mb} MB\n"
+            f"TTL: {ttl} сек\n"
+            f"MAX_CACHE_FILES: {max_files}"
+        )
+        await update.callback_query.edit_message_text(text, reply_markup=build_admin_keyboard())
+        return
+
+    if data == "admin_maintenance":
+        MAINTENANCE_MODE = not MAINTENANCE_MODE
+        if DB_PATH is not None:
+            await asyncio.to_thread(db_set_counter, "maintenance", 1 if MAINTENANCE_MODE else 0)
+        text = f"Техработы: {'ON' if MAINTENANCE_MODE else 'OFF'}"
+        await update.callback_query.edit_message_text(text, reply_markup=build_admin_keyboard())
+        return
+
+    if data == "admin_broadcast":
+        context.user_data["awaiting_broadcast"] = True
+        await update.callback_query.edit_message_text(
+            "Пришли текст рассылки следующим сообщением (или используй /broadcast <текст>).",
+            reply_markup=build_admin_keyboard(),
+        )
+        return
+
+
+async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, text: str) -> tuple[int, int]:
+    if DB_PATH is None:
+        return 0, 0
+    user_ids = await asyncio.to_thread(db_list_user_ids)
+    ok = 0
+    failed = 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+            ok += 1
+        except RetryAfter as e:
+            await asyncio.sleep(float(getattr(e, "retry_after", 1.0)))
+            try:
+                await context.bot.send_message(chat_id=uid, text=text)
+                ok += 1
+            except Exception:
+                failed += 1
+        except (Forbidden, BadRequest):
+            failed += 1
+        except (TimedOut, NetworkError):
+            failed += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.03)
+    return ok, failed
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Нет доступа")
+        return
+
+    text = " ".join(getattr(context, "args", []) or []).strip()
+    if not text:
+        context.user_data["awaiting_broadcast"] = True
+        await update.message.reply_text("Пришли текст рассылки следующим сообщением.")
+        return
+
+    ok, failed = await do_broadcast(context, text)
+    await update.message.reply_text(f"Рассылка завершена. OK: {ok}, FAIL: {failed}")
 
 
 async def on_download_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -260,6 +552,21 @@ async def on_download_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
+        return
+
+    if update.effective_user and DB_PATH is not None:
+        await asyncio.to_thread(
+            db_upsert_user,
+            update.effective_user.id,
+            update.effective_user.username,
+            update.effective_user.first_name,
+            update.effective_user.last_name,
+        )
+
+    if update.effective_user and is_admin(update.effective_user.id) and context.user_data.get("awaiting_broadcast"):
+        context.user_data["awaiting_broadcast"] = False
+        ok, failed = await do_broadcast(context, update.message.text)
+        await update.message.reply_text(f"Рассылка завершена. OK: {ok}, FAIL: {failed}")
         return
 
     match = TIKTOK_URL_RE.search(update.message.text)
@@ -285,7 +592,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Бот ещё запускается, попробуй через пару секунд.")
         return
 
+    if MAINTENANCE_MODE and not is_admin(user_id):
+        await update.message.reply_text("Сейчас идут техработы. Попробуй позже.")
+        return
+
     url = match.group(0)
+
+    if DB_PATH is not None:
+        await asyncio.to_thread(db_inc_counter, "requests", 1)
 
     async with user_lock:
         async with GLOBAL_DOWNLOAD_SEMAPHORE:
@@ -295,6 +609,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             cached = False
             try:
                 video_path, cached = await download_tiktok_video(url)
+                if DB_PATH is not None:
+                    await asyncio.to_thread(db_inc_counter, "cache_hit" if cached else "cache_miss", 1)
                 if not video_path.exists():
                     raise RuntimeError("Видео не удалось скачать: файл не найден")
 
@@ -318,11 +634,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     await status.delete()
                 except Exception:
                     pass
+
+                if DB_PATH is not None:
+                    await asyncio.to_thread(db_inc_counter, "success", 1)
             except Exception as e:
                 try:
                     await status.edit_text(f"Ошибка при скачивании: {e}")
                 except Exception:
                     await update.message.reply_text(f"Ошибка при скачивании: {e}")
+
+                if DB_PATH is not None:
+                    await asyncio.to_thread(db_inc_counter, "errors", 1)
             finally:
                 if video_path is not None and not cached:
                     await safe_cleanup(video_path)
@@ -333,6 +655,9 @@ def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN не задан. Создай .env на основе .env.example")
+
+    global ADMIN_IDS
+    ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS"))
 
     max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
     global GLOBAL_DOWNLOAD_SEMAPHORE
@@ -347,13 +672,28 @@ def main() -> None:
     except Exception:
         CACHE_DIR = None
 
+    global DATA_DIR, DB_PATH, MAINTENANCE_MODE
+    DATA_DIR = Path(os.getenv("DATA_DIR", ".data"))
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        DB_PATH = DATA_DIR / "bot.db"
+        db_init()
+        MAINTENANCE_MODE = bool(db_get_counter("maintenance", 0))
+    except Exception:
+        DB_PATH = None
+        MAINTENANCE_MODE = False
+
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("myid", cmd_myid))
+    application.add_handler(CommandHandler("admin", cmd_admin))
+    application.add_handler(CommandHandler("broadcast", cmd_broadcast))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(on_download_more, pattern=r"^download_more$"))
+    application.add_handler(CallbackQueryHandler(on_admin_callback, pattern=r"^admin_"))
 
     application.run_polling()
 
