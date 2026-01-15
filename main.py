@@ -31,6 +31,11 @@ TIKTOK_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+YOUTUBE_SHORTS_URL_RE = re.compile(
+    r"https?://(?:www\.)?youtube\.com/shorts/[A-Za-z0-9_-]+(?:\?[^\s]+)?",
+    re.IGNORECASE,
+)
+
 
 BOT_USERNAME = "videodrophub_bot"
 BOT_URL = f"https://t.me/{BOT_USERNAME}"
@@ -213,6 +218,20 @@ def get_cache_stats() -> tuple[int, int]:
         return count, total
     except Exception:
         return 0, 0
+
+
+def find_first_supported_url(text: str) -> str | None:
+    matches: list[re.Match[str]] = []
+    m1 = TIKTOK_URL_RE.search(text)
+    if m1:
+        matches.append(m1)
+    m2 = YOUTUBE_SHORTS_URL_RE.search(text)
+    if m2:
+        matches.append(m2)
+    if not matches:
+        return None
+    first = min(matches, key=lambda m: m.start())
+    return first.group(0)
 
 
 def _cache_key(url: str) -> str:
@@ -406,7 +425,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             update.effective_user.last_name,
         )
     await update.message.reply_text(
-        "Пришли ссылку на видео TikTok — я попробую скачать и отправить файл обратно.",
+        "Пришли ссылку на TikTok или YouTube Shorts — я попробую скачать и отправить файл обратно.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -546,7 +565,7 @@ async def on_download_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if update.effective_chat:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="Пришли новую ссылку на TikTok — я скачаю видео.",
+            text="Пришли новую ссылку на TikTok или YouTube Shorts — я скачаю видео.",
         )
 
 
@@ -569,9 +588,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Рассылка завершена. OK: {ok}, FAIL: {failed}")
         return
 
-    match = TIKTOK_URL_RE.search(update.message.text)
-    if not match:
-        await update.message.reply_text("Не вижу ссылку TikTok. Пришли, пожалуйста, ссылку на видео.")
+    url = find_first_supported_url(update.message.text)
+    if not url:
+        await update.message.reply_text(
+            "Не вижу ссылку TikTok или YouTube Shorts. Пришли, пожалуйста, ссылку на видео."
+        )
         return
 
     if not update.effective_user:
@@ -595,8 +616,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if MAINTENANCE_MODE and not is_admin(user_id):
         await update.message.reply_text("Сейчас идут техработы. Попробуй позже.")
         return
-
-    url = match.group(0)
 
     if DB_PATH is not None:
         await asyncio.to_thread(db_inc_counter, "requests", 1)
