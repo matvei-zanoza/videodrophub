@@ -37,6 +37,16 @@ YOUTUBE_SHORTS_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+SORA_SHARE_URL_RE = re.compile(
+    r"https?://sora\.chatgpt\.com/p/[A-Za-z0-9_]+(?:\?[^\s]+)?",
+    re.IGNORECASE,
+)
+
+DIRECT_VIDEO_URL_RE = re.compile(
+    r"https?://[^\s]+\.(?:mp4|webm|m3u8|mpd)(?:\?[^\s]+)?",
+    re.IGNORECASE,
+)
+
 
 BOT_USERNAME = "videodrophub_bot"
 BOT_URL = f"https://t.me/{BOT_USERNAME}"
@@ -230,6 +240,9 @@ def find_first_supported_url(text: str) -> str | None:
     m1 = TIKTOK_URL_RE.search(text)
     if m1:
         matches.append(m1)
+    m0 = DIRECT_VIDEO_URL_RE.search(text)
+    if m0:
+        matches.append(m0)
     if ENABLE_YOUTUBE:
         m2 = YOUTUBE_SHORTS_URL_RE.search(text)
         if m2:
@@ -657,6 +670,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data["awaiting_broadcast"] = False
         ok, failed = await do_broadcast(context, update.message.text)
         await update.message.reply_text(f"Рассылка завершена. OK: {ok}, FAIL: {failed}")
+        return
+
+    if SORA_SHARE_URL_RE.search(update.message.text) and not DIRECT_VIDEO_URL_RE.search(update.message.text):
+        await update.message.reply_text(
+            "Ссылки Sora (sora.chatgpt.com/p/...) сервер часто блокирует для ботов. "
+            "Пришли, пожалуйста, прямую ссылку на видео (.mp4/.webm) или поток (.m3u8/.mpd) — я смогу скачать и отправить."
+        )
         return
 
     if not ENABLE_YOUTUBE and YOUTUBE_SHORTS_URL_RE.search(update.message.text):
