@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -32,6 +35,10 @@ BOT_URL = f"https://t.me/{BOT_USERNAME}"
 GLOBAL_DOWNLOAD_SEMAPHORE: asyncio.Semaphore | None = None
 USER_LOCKS: dict[int, asyncio.Lock] = {}
 
+CACHE_DIR: Path | None = None
+CACHE_TTL_SECONDS: int | None = None
+MAX_CACHE_FILES: int | None = None
+
 
 def get_share_url() -> str:
     text = "Скачай видео из TikTok через бота"
@@ -52,9 +59,103 @@ def build_result_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _download_tiktok_video_sync(url: str, out_dir: Path) -> Path:
+def _cache_key(url: str) -> str:
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+
+
+def _cache_paths(url: str) -> tuple[Path, Path] | None:
+    if CACHE_DIR is None:
+        return None
+    key = _cache_key(url)
+    return (CACHE_DIR / f"{key}.mp4", CACHE_DIR / f"{key}.json")
+
+
+def _read_cache_meta(meta_path: Path) -> dict | None:
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _is_cache_valid(video_path: Path, meta_path: Path) -> bool:
+    if CACHE_TTL_SECONDS is None:
+        return False
+    if not video_path.exists() or not meta_path.exists():
+        return False
+    meta = _read_cache_meta(meta_path)
+    if not meta or "created_at" not in meta:
+        return False
+    try:
+        created_at = float(meta["created_at"])
+    except Exception:
+        return False
+    return (time.time() - created_at) <= CACHE_TTL_SECONDS
+
+
+def _touch(path: Path) -> None:
+    try:
+        now = time.time()
+        os.utime(path, (now, now))
+    except Exception:
+        pass
+
+
+def _prune_cache() -> None:
+    if CACHE_DIR is None or CACHE_TTL_SECONDS is None or MAX_CACHE_FILES is None:
+        return
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+        now = time.time()
+        metas = list(CACHE_DIR.glob("*.json"))
+
+        for meta_path in metas:
+            video_path = meta_path.with_suffix(".mp4")
+            meta = _read_cache_meta(meta_path)
+            created_at = None
+            if meta and "created_at" in meta:
+                try:
+                    created_at = float(meta["created_at"])
+                except Exception:
+                    created_at = None
+
+            expired = created_at is None or (now - created_at) > CACHE_TTL_SECONDS
+            if expired:
+                try:
+                    meta_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                try:
+                    video_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        metas = list(CACHE_DIR.glob("*.json"))
+        if len(metas) <= MAX_CACHE_FILES:
+            return
+
+        metas_sorted = sorted(metas, key=lambda p: p.stat().st_mtime)
+        to_remove = metas_sorted[: max(0, len(metas_sorted) - MAX_CACHE_FILES)]
+        for meta_path in to_remove:
+            video_path = meta_path.with_suffix(".mp4")
+            try:
+                meta_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                video_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception:
+        return
+
+
+def _download_tiktok_video_sync(url: str, out_dir: Path, filename_base: str | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    outtmpl = str(out_dir / "%(id)s.%(ext)s")
+    if filename_base:
+        outtmpl = str(out_dir / f"{filename_base}.%(ext)s")
+    else:
+        outtmpl = str(out_dir / "%(id)s.%(ext)s")
 
     ydl_opts = {
         "outtmpl": outtmpl,
@@ -77,9 +178,45 @@ def _download_tiktok_video_sync(url: str, out_dir: Path) -> Path:
     return path
 
 
-async def download_tiktok_video(url: str) -> Path:
+async def download_tiktok_video(url: str) -> tuple[Path, bool]:
+    cache_pair = _cache_paths(url)
+    if cache_pair is not None:
+        video_path, meta_path = cache_pair
+        if _is_cache_valid(video_path, meta_path):
+            _touch(video_path)
+            _touch(meta_path)
+            return video_path, True
+
+    if cache_pair is not None:
+        video_path, meta_path = cache_pair
+        key = video_path.stem
+        path = await asyncio.to_thread(_download_tiktok_video_sync, url, CACHE_DIR, key)
+        final_path = path
+        if final_path.suffix.lower() != ".mp4":
+            mp4_candidate = final_path.with_suffix(".mp4")
+            if mp4_candidate.exists():
+                final_path = mp4_candidate
+
+        if final_path != video_path and final_path.exists():
+            try:
+                final_path.replace(video_path)
+            except Exception:
+                pass
+
+        try:
+            meta_path.write_text(
+                json.dumps({"created_at": time.time()}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+        await asyncio.to_thread(_prune_cache)
+        return video_path, True
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="tiktok_"))
-    return await asyncio.to_thread(_download_tiktok_video_sync, url, tmp_dir)
+    path = await asyncio.to_thread(_download_tiktok_video_sync, url, tmp_dir, None)
+    return path, False
 
 
 async def safe_cleanup(path: Path) -> None:
@@ -155,8 +292,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             status = await update.message.reply_text("Скачиваю…")
 
             video_path: Path | None = None
+            cached = False
             try:
-                video_path = await download_tiktok_video(url)
+                video_path, cached = await download_tiktok_video(url)
                 if not video_path.exists():
                     raise RuntimeError("Видео не удалось скачать: файл не найден")
 
@@ -186,7 +324,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 except Exception:
                     await update.message.reply_text(f"Ошибка при скачивании: {e}")
             finally:
-                if video_path is not None:
+                if video_path is not None and not cached:
                     await safe_cleanup(video_path)
 
 
@@ -199,6 +337,15 @@ def main() -> None:
     max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
     global GLOBAL_DOWNLOAD_SEMAPHORE
     GLOBAL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(max_concurrent)
+
+    global CACHE_DIR, CACHE_TTL_SECONDS, MAX_CACHE_FILES
+    CACHE_DIR = Path(os.getenv("CACHE_DIR", ".cache"))
+    CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "21600"))
+    MAX_CACHE_FILES = int(os.getenv("MAX_CACHE_FILES", "50"))
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        CACHE_DIR = None
 
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
