@@ -122,6 +122,7 @@ def main() -> None:
         raise RuntimeError("BOT_TOKEN не задан. Создай .env на основе .env.example")
 
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", cmd_start))
