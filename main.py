@@ -63,6 +63,8 @@ BOT_URL = f"https://t.me/{BOT_USERNAME}"
 
 GLOBAL_DOWNLOAD_SEMAPHORE: asyncio.Semaphore | None = None
 USER_LOCKS: dict[int, asyncio.Lock] = {}
+ACTIVE_DOWNLOADS = 0
+ACTIVE_DOWNLOADS_LOCK: asyncio.Lock | None = None
 
 CACHE_DIR: Path | None = None
 CACHE_TTL_SECONDS: int | None = None
@@ -76,6 +78,8 @@ ADMIN_IDS: set[int] = set()
 MAINTENANCE_MODE = False
 
 ENABLE_YOUTUBE = False
+
+STARTED_AT = time.time()
 
 
 def get_share_url() -> str:
@@ -137,6 +141,7 @@ def build_admin_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Рассылка", callback_data="admin_broadcast"),
                 InlineKeyboardButton("Техработы", callback_data="admin_maintenance"),
             ],
+            [InlineKeyboardButton("Логи", callback_data="admin_logs")],
             [InlineKeyboardButton("Закрыть", callback_data="admin_close")],
         ]
     )
@@ -163,9 +168,20 @@ def is_admin(user_id: int | None) -> bool:
     return user_id in ADMIN_IDS
 
 
+def _get_active_downloads_lock() -> asyncio.Lock:
+    global ACTIVE_DOWNLOADS_LOCK
+    if ACTIVE_DOWNLOADS_LOCK is None:
+        ACTIVE_DOWNLOADS_LOCK = asyncio.Lock()
+    return ACTIVE_DOWNLOADS_LOCK
+
+
 def _db_connect() -> sqlite3.Connection:
     if DB_PATH is None:
         raise RuntimeError("DB not configured")
+    try:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -193,7 +209,103 @@ def db_init() -> None:
             " value INTEGER NOT NULL"
             ")"
         )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS download_events ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts REAL NOT NULL,"
+            " user_id INTEGER,"
+            " platform TEXT NOT NULL,"
+            " status TEXT NOT NULL,"
+            " cached INTEGER NOT NULL DEFAULT 0,"
+            " error_kind TEXT"
+            ")"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_download_events_ts ON download_events(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_download_events_platform_ts ON download_events(platform, ts)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS admin_events ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts REAL NOT NULL,"
+            " admin_id INTEGER,"
+            " action TEXT NOT NULL,"
+            " details TEXT"
+            ")"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_admin_events_ts ON admin_events(ts)")
         conn.commit()
+
+
+def _detect_platform(url: str) -> str:
+    if TIKTOK_URL_RE.search(url):
+        return "tiktok"
+    if VK_CLIP_URL_RE.search(url):
+        return "vk"
+    if INSTAGRAM_REEL_URL_RE.search(url):
+        return "instagram"
+    if YOUTUBE_SHORTS_URL_RE.search(url):
+        return "youtube"
+    if DIRECT_VIDEO_URL_RE.search(url):
+        return "direct"
+    if SORA_SHARE_URL_RE.search(url):
+        return "sora"
+    return "other"
+
+
+def db_log_download_event(
+    *,
+    user_id: int | None,
+    url: str,
+    status: str,
+    cached: bool = False,
+    error_kind: str | None = None,
+) -> None:
+    now = time.time()
+    platform = _detect_platform(url)
+    with contextlib.closing(_db_connect()) as conn:
+        conn.execute(
+            "INSERT INTO download_events(ts, user_id, platform, status, cached, error_kind) VALUES(?, ?, ?, ?, ?, ?)",
+            (now, user_id, platform, status, 1 if cached else 0, error_kind),
+        )
+        conn.commit()
+
+
+def db_log_admin_event(*, admin_id: int | None, action: str, details: str | None = None) -> None:
+    now = time.time()
+    with contextlib.closing(_db_connect()) as conn:
+        conn.execute(
+            "INSERT INTO admin_events(ts, admin_id, action, details) VALUES(?, ?, ?, ?)",
+            (now, admin_id, action, details),
+        )
+        conn.commit()
+
+
+def _time_human(ts: float) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except Exception:
+        return str(int(ts))
+
+
+def db_get_download_stats_since(since_ts: float) -> dict[str, int]:
+    with contextlib.closing(_db_connect()) as conn:
+        cur = conn.execute(
+            "SELECT platform, status, COUNT(*) AS c FROM download_events WHERE ts>=? GROUP BY platform, status",
+            (since_ts,),
+        )
+        out: dict[str, int] = {}
+        for r in cur.fetchall():
+            key = f"{str(r['platform'])}:{str(r['status'])}"
+            out[key] = int(r["c"])
+        return out
+
+
+def db_get_recent_admin_events(limit: int = 20) -> list[sqlite3.Row]:
+    with contextlib.closing(_db_connect()) as conn:
+        cur = conn.execute(
+            "SELECT ts, admin_id, action, details FROM admin_events ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        )
+        return list(cur.fetchall())
 
 
 def db_set_counter(key: str, value: int) -> None:
@@ -604,7 +716,24 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if DB_PATH is None:
             text = "DB не настроена"
         else:
+            await asyncio.to_thread(db_log_admin_event, admin_id=user_id, action="admin_stats")
             summary = await asyncio.to_thread(db_get_summary)
+            now = time.time()
+            stats_24h = await asyncio.to_thread(db_get_download_stats_since, now - 24 * 3600)
+            stats_7d = await asyncio.to_thread(db_get_download_stats_since, now - 7 * 24 * 3600)
+            uptime_s = int(time.time() - STARTED_AT)
+            uptime_h = uptime_s // 3600
+            uptime_m = (uptime_s % 3600) // 60
+            async with _get_active_downloads_lock():
+                active = ACTIVE_DOWNLOADS
+            cache_count, cache_size = await asyncio.to_thread(get_cache_stats)
+            cache_mb = round(cache_size / (1024 * 1024), 2)
+
+            def _fmt_platform(stats: dict[str, int], platform: str) -> str:
+                ok = stats.get(f"{platform}:success", 0)
+                err = stats.get(f"{platform}:error", 0)
+                return f"{platform} ✅{ok} ❌{err}"
+
             text = (
                 f"Пользователи: {summary.get('users', 0)}\n"
                 f"Запросы: {summary.get('requests', 0)}\n"
@@ -612,6 +741,14 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"Ошибки: {summary.get('errors', 0)}\n"
                 f"Cache hit: {summary.get('cache_hit', 0)}\n"
                 f"Cache miss: {summary.get('cache_miss', 0)}\n"
+                "\n"
+                f"За 24ч: {_fmt_platform(stats_24h, 'tiktok')} | {_fmt_platform(stats_24h, 'vk')} | {_fmt_platform(stats_24h, 'instagram')}\n"
+                f"За 7д: {_fmt_platform(stats_7d, 'tiktok')} | {_fmt_platform(stats_7d, 'vk')} | {_fmt_platform(stats_7d, 'instagram')}\n"
+                "\n"
+                f"Uptime: {uptime_h}h {uptime_m}m\n"
+                f"Active downloads: {active}\n"
+                f"Cache: {cache_count} files / {cache_mb} MB\n"
+                f"ENABLE_YOUTUBE: {'ON' if ENABLE_YOUTUBE else 'OFF'}\n"
                 f"YouTube cookies: {'ON' if _has_ytdlp_cookies() else 'OFF'}\n"
                 f"Техработы: {'ON' if MAINTENANCE_MODE else 'OFF'}"
             )
@@ -619,6 +756,8 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if data == "admin_cache":
+        if DB_PATH is not None:
+            await asyncio.to_thread(db_log_admin_event, admin_id=user_id, action="admin_cache")
         count, size = await asyncio.to_thread(get_cache_stats)
         size_mb = round(size / (1024 * 1024), 2)
         ttl = CACHE_TTL_SECONDS or 0
@@ -636,16 +775,47 @@ async def on_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         MAINTENANCE_MODE = not MAINTENANCE_MODE
         if DB_PATH is not None:
             await asyncio.to_thread(db_set_counter, "maintenance", 1 if MAINTENANCE_MODE else 0)
+            await asyncio.to_thread(
+                db_log_admin_event,
+                admin_id=user_id,
+                action="admin_maintenance_toggle",
+                details="ON" if MAINTENANCE_MODE else "OFF",
+            )
         text = f"Техработы: {'ON' if MAINTENANCE_MODE else 'OFF'}"
         await update.callback_query.edit_message_text(text, reply_markup=build_admin_keyboard())
         return
 
     if data == "admin_broadcast":
         context.user_data["awaiting_broadcast"] = True
+        if DB_PATH is not None:
+            await asyncio.to_thread(db_log_admin_event, admin_id=user_id, action="admin_broadcast_prompt")
         await update.callback_query.edit_message_text(
             "Пришли текст рассылки следующим сообщением (или используй /broadcast <текст>).",
             reply_markup=build_admin_keyboard(),
         )
+        return
+
+    if data == "admin_logs":
+        if DB_PATH is None:
+            text = "DB не настроена"
+        else:
+            await asyncio.to_thread(db_log_admin_event, admin_id=user_id, action="admin_logs")
+            rows = await asyncio.to_thread(db_get_recent_admin_events, 20)
+            if not rows:
+                text = "Логи пустые"
+            else:
+                lines: list[str] = []
+                for r in rows:
+                    ts = _time_human(float(r["ts"]))
+                    aid = r["admin_id"]
+                    action = r["action"]
+                    details = r["details"]
+                    if details:
+                        lines.append(f"{ts} | {aid} | {action} | {details}")
+                    else:
+                        lines.append(f"{ts} | {aid} | {action}")
+                text = "\n".join(lines)
+        await update.callback_query.edit_message_text(text, reply_markup=build_admin_keyboard())
         return
 
 
@@ -690,6 +860,13 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     ok, failed = await do_broadcast(context, text)
+    if DB_PATH is not None:
+        await asyncio.to_thread(
+            db_log_admin_event,
+            admin_id=update.effective_user.id,
+            action="broadcast_done",
+            details=f"ok={ok} fail={failed} len={len(text)}",
+        )
     await update.message.reply_text(f"Рассылка завершена. OK: {ok}, FAIL: {failed}")
 
 
@@ -710,6 +887,8 @@ async def on_download_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
+
+    global ACTIVE_DOWNLOADS
 
     if update.effective_user and DB_PATH is not None:
         await asyncio.to_thread(
@@ -772,10 +951,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     async with user_lock:
         async with GLOBAL_DOWNLOAD_SEMAPHORE:
-            status = await update.message.reply_text("Скачиваю…")
-
-            video_path: Path | None = None
+            async with _get_active_downloads_lock():
+                ACTIVE_DOWNLOADS += 1
+            video_path = None
             cached = False
+            status = await update.message.reply_text("Скачиваю... ⏳")
             try:
                 video_path, cached = await download_tiktok_video(url)
                 if DB_PATH is not None:
@@ -806,8 +986,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
                 if DB_PATH is not None:
                     await asyncio.to_thread(db_inc_counter, "success", 1)
+                    await asyncio.to_thread(
+                        db_log_download_event,
+                        user_id=update.effective_user.id if update.effective_user else None,
+                        url=url,
+                        status="success",
+                        cached=cached,
+                    )
             except Exception as e:
                 err_text = str(e)
+                error_kind = "other"
                 if YOUTUBE_SHORTS_URL_RE.search(url) and _looks_like_youtube_cookie_error(err_text):
                     if _has_ytdlp_cookies():
                         user_error = (
@@ -819,16 +1007,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                             "YouTube попросил подтверждение (анти-бот). "
                             "Чтобы скачивание работало, админ должен подключить cookies для yt-dlp."
                         )
+                    error_kind = "youtube_auth"
                 elif VK_CLIP_URL_RE.search(url) and _looks_like_vk_auth_error(err_text):
                     user_error = (
                         "VK ограничил доступ к этому клипу (возможна приватность/нужна авторизация). "
                         "Попробуй другой клип или отправь прямую ссылку на .mp4/.m3u8."
                     )
+                    error_kind = "vk_auth"
                 elif INSTAGRAM_REEL_URL_RE.search(url) and _looks_like_instagram_auth_error(err_text):
                     user_error = (
                         "Instagram ограничил доступ (часто нужна авторизация/подтверждение). "
                         "Попробуй другой рилс или пришли прямую ссылку на .mp4/.m3u8."
                     )
+                    error_kind = "instagram_auth"
                 else:
                     user_error = f"Ошибка при скачивании: {e}"
 
@@ -839,7 +1030,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
                 if DB_PATH is not None:
                     await asyncio.to_thread(db_inc_counter, "errors", 1)
+                    await asyncio.to_thread(
+                        db_log_download_event,
+                        user_id=update.effective_user.id if update.effective_user else None,
+                        url=url,
+                        status="error",
+                        cached=cached,
+                        error_kind=error_kind,
+                    )
             finally:
+                async with _get_active_downloads_lock():
+                    ACTIVE_DOWNLOADS -= 1
                 if video_path is not None and not cached:
                     await safe_cleanup(video_path)
 
