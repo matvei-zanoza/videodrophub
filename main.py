@@ -14,7 +14,7 @@ import urllib.parse
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
@@ -980,7 +980,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "•\tInstagram Reels 📸\n\n"
         "Можно присылать прямые ссылки:\n"
         ".mp4 · .webm · .m3u8 · .mpd\n\n"
-        "Просто вставь ссылку и получи видео. Всё."
+        "Просто вставь ссылку и получи видео. Всё.\n\n"
+        "Справка и команды: /help"
     )
     await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
 
@@ -989,6 +990,60 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
     await update.message.reply_text(str(update.effective_user.id))
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    is_user_admin = bool(update.effective_user and is_admin(update.effective_user.id))
+
+    user_block = (
+        "Команды:\n"
+        "/start — начать\n"
+        "/limits — текущие ограничения\n"
+        "/stats me — твоя статистика\n"
+        "\n"
+        "Просто пришли ссылку на видео — я скачаю и отправлю файлом."
+    )
+
+    if not is_user_admin:
+        await update.message.reply_text(user_block)
+        return
+
+    admin_block = (
+        "\n\nАдмин:\n"
+        "/health — диагностика\n"
+        "/admin — админ-панель\n"
+        "/broadcast — рассылка"
+    )
+    await update.message.reply_text(user_block + admin_block)
+
+
+async def _set_bot_commands(application: Application) -> None:
+    user_cmds = [
+        BotCommand("start", "start"),
+        BotCommand("help", "help"),
+        BotCommand("limits", "limits"),
+        BotCommand("stats", "stats me"),
+    ]
+    admin_cmds = user_cmds + [
+        BotCommand("health", "health"),
+        BotCommand("admin", "admin"),
+        BotCommand("broadcast", "broadcast"),
+        BotCommand("myid", "myid"),
+    ]
+
+    try:
+        await application.bot.set_my_commands(user_cmds)
+    except Exception:
+        pass
+
+    for admin_id in sorted(ADMIN_IDS):
+        try:
+            await application.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception:
+            continue
 
 
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1434,7 +1489,9 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     application = Application.builder().token(token).build()
+    application.post_init = _set_bot_commands
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("myid", cmd_myid))
     application.add_handler(CommandHandler("health", cmd_health))
     application.add_handler(CommandHandler("limits", cmd_limits))
