@@ -1159,6 +1159,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Галоши постирал!")
         return
 
+    if update.message.text.strip().casefold() in {"что ты умеешь?", "что ты умеешь"}:
+        await update.message.reply_text("Я нихуя не умею как и кое кто(")
+        return
+
     url, parse_error = parse_message(update.message.text)
     if parse_error:
         await update.message.reply_text(parse_error)
