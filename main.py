@@ -37,6 +37,11 @@ VK_CLIP_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+INSTAGRAM_REEL_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:instagram\.com|instagr\.am)/(?:reel|reels)/[A-Za-z0-9_-]+(?:\?[^\s]+)?",
+    re.IGNORECASE,
+)
+
 YOUTUBE_SHORTS_URL_RE = re.compile(
     r"https?://(?:www\.)?youtube\.com/shorts/[A-Za-z0-9_-]+(?:\?[^\s]+)?",
     re.IGNORECASE,
@@ -103,6 +108,21 @@ def _looks_like_vk_auth_error(message: str) -> bool:
         or "forbidden" in m
         or "http error 403" in m
         or "http error 401" in m
+    )
+
+
+def _looks_like_instagram_auth_error(message: str) -> bool:
+    m = message.lower()
+    return (
+        "login required" in m
+        or "checkpoint_required" in m
+        or "challenge_required" in m
+        or "consent_required" in m
+        or "please wait a few minutes" in m
+        or "rate limit" in m
+        or "http error 403" in m
+        or "http error 401" in m
+        or "forbidden" in m
     )
 
 
@@ -262,6 +282,9 @@ def find_first_supported_url(text: str) -> str | None:
     m_vk = VK_CLIP_URL_RE.search(text)
     if m_vk:
         matches.append(m_vk)
+    m_ig = INSTAGRAM_REEL_URL_RE.search(text)
+    if m_ig:
+        matches.append(m_ig)
     m0 = DIRECT_VIDEO_URL_RE.search(text)
     if m0:
         matches.append(m0)
@@ -543,6 +566,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Поддерживаю:\n"
             "— TikTok 🎬\n"
             "— VK Клипы 🟦\n"
+            "— Instagram Reels 📸\n"
             "— YouTube Shorts ▶️\n\n"
             "Можно отправлять прямые ссылки 🔗\n"
             ".mp4 / .webm / .m3u8 / .mpd\n\n"
@@ -687,9 +711,9 @@ async def on_download_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await update.callback_query.answer()
     if update.effective_chat:
-        prompt = "Пришли новую ссылку на TikTok или VK Клипы — я скачаю видео."
+        prompt = "Пришли новую ссылку на TikTok / VK Клипы / Instagram Reels — я скачаю видео."
         if ENABLE_YOUTUBE:
-            prompt = "Пришли новую ссылку на TikTok, VK Клипы или YouTube Shorts — я скачаю видео."
+            prompt = "Пришли новую ссылку на TikTok / VK Клипы / Instagram Reels / YouTube Shorts — я скачаю видео."
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=prompt,
@@ -728,9 +752,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     url = find_first_supported_url(update.message.text)
     if not url:
-        text = "Не вижу ссылку TikTok или VK Клипы. Пришли, пожалуйста, ссылку на видео."
+        text = "Не вижу ссылку TikTok / VK Клипы / Instagram Reels. Пришли, пожалуйста, ссылку на видео."
         if ENABLE_YOUTUBE:
-            text = "Не вижу ссылку TikTok, VK Клипы или YouTube Shorts. Пришли, пожалуйста, ссылку на видео."
+            text = "Не вижу ссылку TikTok / VK Клипы / Instagram Reels / YouTube Shorts. Пришли, пожалуйста, ссылку на видео."
         await update.message.reply_text(text)
         return
 
@@ -812,6 +836,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     user_error = (
                         "VK ограничил доступ к этому клипу (возможна приватность/нужна авторизация). "
                         "Попробуй другой клип или отправь прямую ссылку на .mp4/.m3u8."
+                    )
+                elif INSTAGRAM_REEL_URL_RE.search(url) and _looks_like_instagram_auth_error(err_text):
+                    user_error = (
+                        "Instagram ограничил доступ (часто нужна авторизация/подтверждение). "
+                        "Попробуй другой рилс или пришли прямую ссылку на .mp4/.m3u8."
                     )
                 else:
                     user_error = f"Ошибка при скачивании: {e}"
