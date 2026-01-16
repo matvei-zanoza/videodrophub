@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import time
@@ -62,6 +63,7 @@ BOT_USERNAME = "videodrophub_bot"
 BOT_URL = f"https://t.me/{BOT_USERNAME}"
 
 GLOBAL_DOWNLOAD_SEMAPHORE: asyncio.Semaphore | None = None
+MAX_CONCURRENT_DOWNLOADS = 2
 USER_LOCKS: dict[int, asyncio.Lock] = {}
 ACTIVE_DOWNLOADS = 0
 ACTIVE_DOWNLOADS_LOCK: asyncio.Lock | None = None
@@ -312,6 +314,36 @@ def db_get_download_stats_since(since_ts: float) -> dict[str, int]:
         return out
 
 
+def db_get_user_status_counts(user_id: int, since_ts: float | None = None) -> dict[str, int]:
+    with contextlib.closing(_db_connect()) as conn:
+        if since_ts is None:
+            cur = conn.execute(
+                "SELECT status, COUNT(*) AS c FROM download_events WHERE user_id=? GROUP BY status",
+                (user_id,),
+            )
+        else:
+            cur = conn.execute(
+                "SELECT status, COUNT(*) AS c FROM download_events WHERE user_id=? AND ts>=? GROUP BY status",
+                (user_id, since_ts),
+            )
+        out: dict[str, int] = {}
+        for r in cur.fetchall():
+            out[str(r["status"])] = int(r["c"])
+        return out
+
+
+def db_get_user_total_requests(user_id: int, since_ts: float | None = None) -> int:
+    with contextlib.closing(_db_connect()) as conn:
+        if since_ts is None:
+            cur = conn.execute("SELECT COUNT(*) AS c FROM download_events WHERE user_id=?", (user_id,))
+        else:
+            cur = conn.execute("SELECT COUNT(*) AS c FROM download_events WHERE user_id=? AND ts>=?", (user_id, since_ts))
+        row = cur.fetchone()
+        if not row:
+            return 0
+        return int(row["c"])
+
+
 def db_get_recent_admin_events(limit: int = 20) -> list[sqlite3.Row]:
     with contextlib.closing(_db_connect()) as conn:
         cur = conn.execute(
@@ -397,6 +429,17 @@ def get_cache_stats() -> tuple[int, int]:
         return count, total
     except Exception:
         return 0, 0
+
+
+def _format_bytes(num: int) -> str:
+    try:
+        mb = num / (1024 * 1024)
+        if mb < 1024:
+            return f"{mb:.2f} MB"
+        gb = mb / 1024
+        return f"{gb:.2f} GB"
+    except Exception:
+        return str(num)
 
 
 def find_first_supported_url(text: str) -> str | None:
@@ -948,6 +991,120 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(str(update.effective_user.id))
 
 
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Нет доступа")
+        return
+
+    uptime_s = int(time.time() - STARTED_AT)
+    uptime_h = uptime_s // 3600
+    uptime_m = (uptime_s % 3600) // 60
+
+    async with _get_active_downloads_lock():
+        active = ACTIVE_DOWNLOADS
+
+    cache_count, cache_size = await asyncio.to_thread(get_cache_stats)
+
+    free_disk = None
+    try:
+        if DATA_DIR is not None:
+            free_disk = int(shutil.disk_usage(str(DATA_DIR)).free)
+    except Exception:
+        free_disk = None
+
+    text = (
+        f"⏱ Uptime: {uptime_h}h {uptime_m}m\n"
+        f"📥 Active downloads: {active}\n"
+        f"🎛 MAX_CONCURRENT_DOWNLOADS: {int(MAX_CONCURRENT_DOWNLOADS)}\n"
+        f"💾 Free disk (DATA_DIR): {_format_bytes(free_disk) if free_disk is not None else 'N/A'}\n"
+        f"🗂 Cache: {cache_count} files / {_format_bytes(cache_size)}\n"
+        f"🚧 Maintenance: {'ON' if MAINTENANCE_MODE else 'OFF'}"
+    )
+    await update.message.reply_text(text)
+
+
+async def cmd_limits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    max_mb = None
+    if MAX_FILESIZE_BYTES is not None:
+        try:
+            max_mb = int(MAX_FILESIZE_BYTES / (1024 * 1024))
+        except Exception:
+            max_mb = None
+
+    max_min = None
+    if MAX_VIDEO_DURATION_SECONDS is not None:
+        try:
+            max_min = round(int(MAX_VIDEO_DURATION_SECONDS) / 60, 1)
+        except Exception:
+            max_min = None
+
+    text = (
+        "Ограничения:\n"
+        f"• Максимальный размер: {f'{max_mb} MB' if max_mb is not None else 'N/A'}\n"
+        f"• Максимальная длительность: {f'{max_min} мин' if max_min is not None else 'N/A'}\n"
+        "• Лимит: 1 загрузка на пользователя\n"
+        f"• Глобальный лимит: {int(MAX_CONCURRENT_DOWNLOADS)} одновременных загрузок\n"
+        "• Поддерживаемые прямые форматы: .mp4 / .webm / .m3u8 / .mpd"
+    )
+    await update.message.reply_text(text)
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+
+    args = [a.strip().lower() for a in (context.args or [])]
+    if args != ["me"]:
+        await update.message.reply_text("Использование: /stats me")
+        return
+
+    if DB_PATH is None:
+        await update.message.reply_text("Статистика недоступна")
+        return
+
+    user_id = update.effective_user.id
+    now = time.time()
+    since_24h = now - 24 * 3600
+    since_7d = now - 7 * 24 * 3600
+
+    try:
+        total = await asyncio.to_thread(db_get_user_total_requests, user_id)
+        status_all = await asyncio.to_thread(db_get_user_status_counts, user_id)
+        total_24h = await asyncio.to_thread(db_get_user_total_requests, user_id, since_24h)
+        status_24h = await asyncio.to_thread(db_get_user_status_counts, user_id, since_24h)
+        total_7d = await asyncio.to_thread(db_get_user_total_requests, user_id, since_7d)
+        status_7d = await asyncio.to_thread(db_get_user_status_counts, user_id, since_7d)
+    except Exception:
+        await update.message.reply_text("Статистика недоступна")
+        return
+
+    if total <= 0:
+        await update.message.reply_text("Пока нет статистики по твоим запросам.")
+        return
+
+    ok = status_all.get("success", 0)
+    err = status_all.get("error", 0)
+    ok_24h = status_24h.get("success", 0)
+    err_24h = status_24h.get("error", 0)
+    ok_7d = status_7d.get("success", 0)
+    err_7d = status_7d.get("error", 0)
+
+    text = (
+        f"📥 Всего запросов: {total}\n"
+        f"✅ Успешных: {ok}\n"
+        f"❌ Ошибок: {err}\n"
+        "\n"
+        f"🕒 За 24 часа: {total_24h} (✅{ok_24h} ❌{err_24h})\n"
+        f"📅 За 7 дней: {total_7d} (✅{ok_7d} ❌{err_7d})"
+    )
+    await update.message.reply_text(text)
+
+
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
@@ -1228,6 +1385,8 @@ def main() -> None:
     ENABLE_YOUTUBE = _parse_bool(os.getenv("ENABLE_YOUTUBE"), default=False)
 
     max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
+    global MAX_CONCURRENT_DOWNLOADS
+    MAX_CONCURRENT_DOWNLOADS = max_concurrent
     global GLOBAL_DOWNLOAD_SEMAPHORE
     GLOBAL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(max_concurrent)
 
@@ -1277,6 +1436,9 @@ def main() -> None:
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("myid", cmd_myid))
+    application.add_handler(CommandHandler("health", cmd_health))
+    application.add_handler(CommandHandler("limits", cmd_limits))
+    application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("admin", cmd_admin))
     application.add_handler(CommandHandler("broadcast", cmd_broadcast))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
