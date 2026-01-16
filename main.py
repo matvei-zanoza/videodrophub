@@ -63,7 +63,7 @@ BOT_USERNAME = "videodrophub_bot"
 BOT_URL = f"https://t.me/{BOT_USERNAME}"
 
 GLOBAL_DOWNLOAD_SEMAPHORE: asyncio.Semaphore | None = None
-MAX_CONCURRENT_DOWNLOADS = 2
+MAX_CONCURRENT_DOWNLOADS = 5
 USER_LOCKS: dict[int, asyncio.Lock] = {}
 ACTIVE_DOWNLOADS = 0
 ACTIVE_DOWNLOADS_LOCK: asyncio.Lock | None = None
@@ -1384,7 +1384,7 @@ def main() -> None:
     global ENABLE_YOUTUBE
     ENABLE_YOUTUBE = _parse_bool(os.getenv("ENABLE_YOUTUBE"), default=False)
 
-    max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
+    max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "5"))
     global MAX_CONCURRENT_DOWNLOADS
     MAX_CONCURRENT_DOWNLOADS = max_concurrent
     global GLOBAL_DOWNLOAD_SEMAPHORE
