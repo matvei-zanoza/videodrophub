@@ -119,6 +119,16 @@ def _looks_like_vk_auth_error(message: str) -> bool:
     )
 
 
+def _looks_like_instagram_rate_limit_error(message: str) -> bool:
+    m = message.lower()
+    return (
+        "please wait a few minutes" in m
+        or "rate limit" in m
+        or "too many requests" in m
+        or "http error 429" in m
+    )
+
+
 def _looks_like_instagram_auth_error(message: str) -> bool:
     m = message.lower()
     return (
@@ -126,8 +136,6 @@ def _looks_like_instagram_auth_error(message: str) -> bool:
         or "checkpoint_required" in m
         or "challenge_required" in m
         or "consent_required" in m
-        or "please wait a few minutes" in m
-        or "rate limit" in m
         or "http error 403" in m
         or "http error 401" in m
         or "forbidden" in m
@@ -764,8 +772,11 @@ async def process_download(
                             or (VK_CLIP_URL_RE.search(url) and _looks_like_vk_auth_error(err_text))
                             or (INSTAGRAM_REEL_URL_RE.search(url) and _looks_like_instagram_auth_error(err_text))
                         )
+                        is_rate_limit = INSTAGRAM_REEL_URL_RE.search(url) and _looks_like_instagram_rate_limit_error(err_text)
                         if is_auth:
                             raise
+                        if is_rate_limit and attempt == 0:
+                            continue
                         if _looks_like_network_error(err_text) and attempt == 0:
                             continue
                         raise
@@ -858,6 +869,9 @@ async def process_download(
                         "Попробуй другой рилс или пришли прямую ссылку на .mp4/.m3u8."
                     )
                     error_kind = "instagram_auth"
+                elif INSTAGRAM_REEL_URL_RE.search(url) and _looks_like_instagram_rate_limit_error(err_text):
+                    user_error = "Instagram временно ограничил запросы (слишком часто). Подожди 5–10 минут и попробуй ещё раз."
+                    error_kind = "instagram_rate_limit"
                 else:
                     user_error = f"Ошибка при скачивании: {e}"
 
