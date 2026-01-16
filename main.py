@@ -66,6 +66,10 @@ USER_LOCKS: dict[int, asyncio.Lock] = {}
 ACTIVE_DOWNLOADS = 0
 ACTIVE_DOWNLOADS_LOCK: asyncio.Lock | None = None
 
+DOWNLOAD_TIMEOUT = 180
+MAX_FILESIZE_BYTES: int | None = None
+MAX_VIDEO_DURATION_SECONDS: int | None = None
+
 CACHE_DIR: Path | None = None
 CACHE_TTL_SECONDS: int | None = None
 MAX_CACHE_FILES: int | None = None
@@ -185,6 +189,7 @@ def _db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=3000")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
@@ -575,6 +580,29 @@ def _download_tiktok_video_sync(url: str, out_dir: Path, filename_base: str | No
         "format": "mp4/best",
     }
 
+    if MAX_FILESIZE_BYTES is not None:
+        ydl_opts["max_filesize"] = int(MAX_FILESIZE_BYTES)
+
+    if MAX_VIDEO_DURATION_SECONDS is not None:
+        max_dur = int(MAX_VIDEO_DURATION_SECONDS)
+
+        def _match_filter(info_dict: dict, *args) -> str | None:
+            try:
+                dur = info_dict.get("duration")
+            except Exception:
+                dur = None
+            if dur is None:
+                return None
+            try:
+                dur_i = int(dur)
+            except Exception:
+                return None
+            if dur_i > max_dur:
+                return "duration_limit_exceeded"
+            return None
+
+        ydl_opts["match_filter"] = _match_filter
+
     if YTDLP_COOKIEFILE is not None and YTDLP_COOKIEFILE.exists():
         ydl_opts["cookiefile"] = str(YTDLP_COOKIEFILE)
 
@@ -629,6 +657,230 @@ async def download_tiktok_video(url: str) -> tuple[Path, bool]:
     tmp_dir = Path(tempfile.mkdtemp(prefix="tiktok_"))
     path = await asyncio.to_thread(_download_tiktok_video_sync, url, tmp_dir, None)
     return path, False
+
+
+def _looks_like_filesize_error(message: str) -> bool:
+    m = message.lower()
+    return "max-filesize" in m or "max filesize" in m or "larger than max" in m
+
+
+def _looks_like_duration_error(message: str) -> bool:
+    m = message.lower()
+    return "duration_limit_exceeded" in m or "duration" in m and "limit" in m
+
+
+def _looks_like_network_error(message: str) -> bool:
+    m = message.lower()
+    return (
+        "timed out" in m
+        or "timeout" in m
+        or "temporarily unavailable" in m
+        or "temporary failure" in m
+        or "connection reset" in m
+        or "connection aborted" in m
+        or "connection refused" in m
+        or "network is unreachable" in m
+        or "name or service not known" in m
+        or "tls" in m and "handshake" in m
+    )
+
+
+def _purge_cache_for_url(url: str) -> None:
+    pair = _cache_paths(url)
+    if pair is None:
+        return
+    video_path, meta_path = pair
+    try:
+        video_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        meta_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def parse_message(text: str) -> tuple[str | None, str | None]:
+    if SORA_SHARE_URL_RE.search(text) and not DIRECT_VIDEO_URL_RE.search(text):
+        return (
+            None,
+            "Ссылки Sora (sora.chatgpt.com/p/...) сервер часто блокирует для ботов. "
+            "Пришли, пожалуйста, прямую ссылку на видео (.mp4/.webm) или поток (.m3u8/.mpd) — я смогу скачать и отправить.",
+        )
+    url = find_first_supported_url(text)
+    if url is None:
+        return None, None
+    return url, None
+
+
+def validate_request(user_id: int | None, url: str) -> str | None:
+    if MAINTENANCE_MODE and not is_admin(user_id):
+        return "Сейчас идут техработы. Попробуй позже."
+    if not ENABLE_YOUTUBE and YOUTUBE_SHORTS_URL_RE.search(url):
+        return "YouTube Shorts пока временно не поддерживаются. Пришли ссылку TikTok."
+    return None
+
+
+async def process_download(
+    *,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    url: str,
+) -> None:
+    global ACTIVE_DOWNLOADS
+
+    user_lock = USER_LOCKS.get(user_id)
+    if user_lock is None:
+        user_lock = asyncio.Lock()
+        USER_LOCKS[user_id] = user_lock
+
+    if DB_PATH is not None:
+        await asyncio.to_thread(db_inc_counter, "requests", 1)
+
+    async with user_lock:
+        async with GLOBAL_DOWNLOAD_SEMAPHORE:
+            async with _get_active_downloads_lock():
+                ACTIVE_DOWNLOADS += 1
+            video_path = None
+            cached = False
+            status = await update.message.reply_text("Скачиваю... ⏳")
+            try:
+                last_exc: Exception | None = None
+                for attempt in range(2):
+                    try:
+                        video_path, cached = await asyncio.wait_for(download_tiktok_video(url), timeout=DOWNLOAD_TIMEOUT)
+                        break
+                    except asyncio.TimeoutError as e:
+                        last_exc = e
+                        if attempt == 0:
+                            continue
+                        raise
+                    except Exception as e:
+                        last_exc = e
+                        err_text = str(e)
+                        is_auth = (
+                            (YOUTUBE_SHORTS_URL_RE.search(url) and _looks_like_youtube_cookie_error(err_text))
+                            or (VK_CLIP_URL_RE.search(url) and _looks_like_vk_auth_error(err_text))
+                            or (INSTAGRAM_REEL_URL_RE.search(url) and _looks_like_instagram_auth_error(err_text))
+                        )
+                        if is_auth:
+                            raise
+                        if _looks_like_network_error(err_text) and attempt == 0:
+                            continue
+                        raise
+
+                if video_path is None:
+                    raise last_exc or RuntimeError("Не удалось скачать видео")
+
+                if DB_PATH is not None:
+                    await asyncio.to_thread(db_inc_counter, "cache_hit" if cached else "cache_miss", 1)
+
+                if not video_path.exists():
+                    raise RuntimeError("Видео не удалось скачать: файл не найден")
+
+                caption = "Готово. Вот ваше видео!\nПоделись ботом: @videodrophub_bot"
+                keyboard = build_result_keyboard()
+
+                try:
+                    with video_path.open("rb") as f:
+                        await context.bot.send_video(
+                            chat_id=update.effective_chat.id,
+                            video=f,
+                            caption=caption,
+                            reply_markup=keyboard,
+                        )
+                except Exception:
+                    _purge_cache_for_url(url)
+                    raise
+
+                try:
+                    await status.delete()
+                except Exception:
+                    pass
+
+                if DB_PATH is not None:
+                    await asyncio.to_thread(db_inc_counter, "success", 1)
+                    await asyncio.to_thread(
+                        db_log_download_event,
+                        user_id=update.effective_user.id if update.effective_user else None,
+                        url=url,
+                        status="success",
+                        cached=cached,
+                    )
+            except asyncio.TimeoutError:
+                user_error = "Скачивание заняло слишком много времени. Попробуй ещё раз."
+                try:
+                    await status.edit_text(user_error)
+                except Exception:
+                    await update.message.reply_text(user_error)
+                if DB_PATH is not None:
+                    await asyncio.to_thread(db_inc_counter, "errors", 1)
+                    await asyncio.to_thread(
+                        db_log_download_event,
+                        user_id=update.effective_user.id if update.effective_user else None,
+                        url=url,
+                        status="error",
+                        cached=cached,
+                        error_kind="timeout",
+                    )
+            except Exception as e:
+                err_text = str(e)
+                error_kind = "other"
+                if _looks_like_filesize_error(err_text):
+                    mb = int((MAX_FILESIZE_BYTES or 0) / (1024 * 1024))
+                    user_error = f"Видео слишком большое. Лимит: {mb} MB."
+                    error_kind = "max_filesize"
+                elif _looks_like_duration_error(err_text):
+                    user_error = f"Видео слишком длинное. Лимит: {int(MAX_VIDEO_DURATION_SECONDS or 0)} сек."
+                    error_kind = "max_duration"
+                elif YOUTUBE_SHORTS_URL_RE.search(url) and _looks_like_youtube_cookie_error(err_text):
+                    if _has_ytdlp_cookies():
+                        user_error = (
+                            "YouTube попросил подтверждение (анти-бот). "
+                            "Cookies уже подключены, но не помогли — нужно обновить cookies."
+                        )
+                    else:
+                        user_error = (
+                            "YouTube попросил подтверждение (анти-бот). "
+                            "Чтобы скачивание работало, админ должен подключить cookies для yt-dlp."
+                        )
+                    error_kind = "youtube_auth"
+                elif VK_CLIP_URL_RE.search(url) and _looks_like_vk_auth_error(err_text):
+                    user_error = (
+                        "VK ограничил доступ к этому клипу (возможна приватность/нужна авторизация). "
+                        "Попробуй другой клип или отправь прямую ссылку на .mp4/.m3u8."
+                    )
+                    error_kind = "vk_auth"
+                elif INSTAGRAM_REEL_URL_RE.search(url) and _looks_like_instagram_auth_error(err_text):
+                    user_error = (
+                        "Instagram ограничил доступ (часто нужна авторизация/подтверждение). "
+                        "Попробуй другой рилс или пришли прямую ссылку на .mp4/.m3u8."
+                    )
+                    error_kind = "instagram_auth"
+                else:
+                    user_error = f"Ошибка при скачивании: {e}"
+
+                try:
+                    await status.edit_text(user_error)
+                except Exception:
+                    await update.message.reply_text(user_error)
+
+                if DB_PATH is not None:
+                    await asyncio.to_thread(db_inc_counter, "errors", 1)
+                    await asyncio.to_thread(
+                        db_log_download_event,
+                        user_id=update.effective_user.id if update.effective_user else None,
+                        url=url,
+                        status="error",
+                        cached=cached,
+                        error_kind=error_kind,
+                    )
+            finally:
+                async with _get_active_downloads_lock():
+                    ACTIVE_DOWNLOADS -= 1
+                if video_path is not None and not cached:
+                    await safe_cleanup(video_path)
 
 
 async def safe_cleanup(path: Path) -> None:
@@ -888,8 +1140,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message or not update.message.text:
         return
 
-    global ACTIVE_DOWNLOADS
-
     if update.effective_user and DB_PATH is not None:
         await asyncio.to_thread(
             db_upsert_user,
@@ -905,18 +1155,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Рассылка завершена. OK: {ok}, FAIL: {failed}")
         return
 
-    if SORA_SHARE_URL_RE.search(update.message.text) and not DIRECT_VIDEO_URL_RE.search(update.message.text):
-        await update.message.reply_text(
-            "Ссылки Sora (sora.chatgpt.com/p/...) сервер часто блокирует для ботов. "
-            "Пришли, пожалуйста, прямую ссылку на видео (.mp4/.webm) или поток (.m3u8/.mpd) — я смогу скачать и отправить."
-        )
+    url, parse_error = parse_message(update.message.text)
+    if parse_error:
+        await update.message.reply_text(parse_error)
         return
 
-    if not ENABLE_YOUTUBE and YOUTUBE_SHORTS_URL_RE.search(update.message.text):
-        await update.message.reply_text("YouTube Shorts пока временно не поддерживаются. Пришли ссылку TikTok.")
-        return
-
-    url = find_first_supported_url(update.message.text)
     if not url:
         text = "Не вижу ссылку TikTok / VK Клипы / Instagram Reels. Пришли, пожалуйста, ссылку на видео."
         if ENABLE_YOUTUBE:
@@ -942,107 +1185,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Бот ещё запускается, попробуй через пару секунд.")
         return
 
-    if MAINTENANCE_MODE and not is_admin(user_id):
-        await update.message.reply_text("Сейчас идут техработы. Попробуй позже.")
+    validation_error = validate_request(user_id, url)
+    if validation_error:
+        await update.message.reply_text(validation_error)
         return
 
-    if DB_PATH is not None:
-        await asyncio.to_thread(db_inc_counter, "requests", 1)
-
-    async with user_lock:
-        async with GLOBAL_DOWNLOAD_SEMAPHORE:
-            async with _get_active_downloads_lock():
-                ACTIVE_DOWNLOADS += 1
-            video_path = None
-            cached = False
-            status = await update.message.reply_text("Скачиваю... ⏳")
-            try:
-                video_path, cached = await download_tiktok_video(url)
-                if DB_PATH is not None:
-                    await asyncio.to_thread(db_inc_counter, "cache_hit" if cached else "cache_miss", 1)
-                if not video_path.exists():
-                    raise RuntimeError("Видео не удалось скачать: файл не найден")
-
-                caption = "Готово. Вот ваше видео!\nПоделись ботом: @videodrophub_bot"
-                keyboard = build_result_keyboard()
-
-                try:
-                    await update.message.reply_video(
-                        video=str(video_path),
-                        caption=caption,
-                        reply_markup=keyboard,
-                    )
-                except Exception:
-                    await update.message.reply_document(
-                        document=str(video_path),
-                        caption=caption,
-                        reply_markup=keyboard,
-                    )
-
-                try:
-                    await status.delete()
-                except Exception:
-                    pass
-
-                if DB_PATH is not None:
-                    await asyncio.to_thread(db_inc_counter, "success", 1)
-                    await asyncio.to_thread(
-                        db_log_download_event,
-                        user_id=update.effective_user.id if update.effective_user else None,
-                        url=url,
-                        status="success",
-                        cached=cached,
-                    )
-            except Exception as e:
-                err_text = str(e)
-                error_kind = "other"
-                if YOUTUBE_SHORTS_URL_RE.search(url) and _looks_like_youtube_cookie_error(err_text):
-                    if _has_ytdlp_cookies():
-                        user_error = (
-                            "YouTube попросил подтверждение (анти-бот). "
-                            "Cookies уже подключены, но не помогли — нужно обновить cookies."
-                        )
-                    else:
-                        user_error = (
-                            "YouTube попросил подтверждение (анти-бот). "
-                            "Чтобы скачивание работало, админ должен подключить cookies для yt-dlp."
-                        )
-                    error_kind = "youtube_auth"
-                elif VK_CLIP_URL_RE.search(url) and _looks_like_vk_auth_error(err_text):
-                    user_error = (
-                        "VK ограничил доступ к этому клипу (возможна приватность/нужна авторизация). "
-                        "Попробуй другой клип или отправь прямую ссылку на .mp4/.m3u8."
-                    )
-                    error_kind = "vk_auth"
-                elif INSTAGRAM_REEL_URL_RE.search(url) and _looks_like_instagram_auth_error(err_text):
-                    user_error = (
-                        "Instagram ограничил доступ (часто нужна авторизация/подтверждение). "
-                        "Попробуй другой рилс или пришли прямую ссылку на .mp4/.m3u8."
-                    )
-                    error_kind = "instagram_auth"
-                else:
-                    user_error = f"Ошибка при скачивании: {e}"
-
-                try:
-                    await status.edit_text(user_error)
-                except Exception:
-                    await update.message.reply_text(user_error)
-
-                if DB_PATH is not None:
-                    await asyncio.to_thread(db_inc_counter, "errors", 1)
-                    await asyncio.to_thread(
-                        db_log_download_event,
-                        user_id=update.effective_user.id if update.effective_user else None,
-                        url=url,
-                        status="error",
-                        cached=cached,
-                        error_kind=error_kind,
-                    )
-            finally:
-                async with _get_active_downloads_lock():
-                    ACTIVE_DOWNLOADS -= 1
-                if video_path is not None and not cached:
-                    await safe_cleanup(video_path)
+    await process_download(update=update, context=context, user_id=user_id, url=url)
 
 
 def main() -> None:
@@ -1061,6 +1209,15 @@ def main() -> None:
     global GLOBAL_DOWNLOAD_SEMAPHORE
     GLOBAL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(max_concurrent)
 
+    global DOWNLOAD_TIMEOUT
+    DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "180"))
+
+    global MAX_FILESIZE_BYTES
+    MAX_FILESIZE_BYTES = int(os.getenv("MAX_FILESIZE_BYTES", str(200 * 1024 * 1024)))
+
+    global MAX_VIDEO_DURATION_SECONDS
+    MAX_VIDEO_DURATION_SECONDS = int(os.getenv("MAX_VIDEO_DURATION_SECONDS", "900"))
+
     global CACHE_DIR, CACHE_TTL_SECONDS, MAX_CACHE_FILES
     CACHE_DIR = Path(os.getenv("CACHE_DIR", ".cache"))
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "21600"))
@@ -1069,6 +1226,14 @@ def main() -> None:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
     except Exception:
         CACHE_DIR = None
+
+    try:
+        if CACHE_DIR is not None and MAX_CACHE_FILES is not None:
+            count, _size = get_cache_stats()
+            if count > int(MAX_CACHE_FILES * 1.2):
+                _prune_cache()
+    except Exception:
+        pass
 
     global DATA_DIR, DB_PATH, MAINTENANCE_MODE
     DATA_DIR = Path(os.getenv("DATA_DIR", ".data"))
