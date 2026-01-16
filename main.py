@@ -1155,6 +1155,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Рассылка завершена. OK: {ok}, FAIL: {failed}")
         return
 
+    if update.message.text.strip().casefold() == "матвей заноза":
+        await update.message.reply_text("Галоши постирал!")
+        return
+
     url, parse_error = parse_message(update.message.text)
     if parse_error:
         await update.message.reply_text(parse_error)
