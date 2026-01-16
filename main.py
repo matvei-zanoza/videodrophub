@@ -1023,9 +1023,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _set_bot_commands(application: Application) -> None:
     user_cmds = [
         BotCommand("start", "start"),
-        BotCommand("help", "help"),
-        BotCommand("limits", "limits"),
-        BotCommand("stats", "stats me"),
+        BotCommand("help", "How to download videos"),
+        BotCommand("limits", "Download limits"),
+        BotCommand("stats", "Your download stats"),
     ]
     admin_cmds = user_cmds + [
         BotCommand("health", "health"),
