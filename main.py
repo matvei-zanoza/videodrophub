@@ -550,30 +550,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             update.effective_user.last_name,
         )
     start_text = (
-        "Привет! 👋\n\n"
-        "Я могу скачать видео по ссылке и отправить файлом 📥\n\n"
+        "👋 Привет!\n\n"
+        "Я скачиваю видео по ссылке и отправляю файлом 📥\n"
+        "Без водяных знаков и лишних телодвижений.\n\n"
         "Поддерживаю:\n"
-        "— TikTok 🎬\n"
-        "— VK Клипы 🟦\n\n"
-        "Можно отправлять прямые ссылки 🔗\n"
-        ".mp4 / .webm / .m3u8 / .mpd\n\n"
-        "Поделись ботом: @videodrophub_bot ✨"
+        "•\tTikTok 🎬\n"
+        "•\tVK Клипы 🟦\n"
+        "•\tInstagram Reels 📸\n\n"
+        "Можно присылать прямые ссылки:\n"
+        ".mp4 · .webm · .m3u8 · .mpd\n\n"
+        "Просто вставь ссылку и получи видео. Всё."
     )
-    if ENABLE_YOUTUBE:
-        start_text = (
-            "Привет! 👋\n\n"
-            "Я могу скачать видео по ссылке и отправить файлом 📥\n\n"
-            "Поддерживаю:\n"
-            "— TikTok 🎬\n"
-            "— VK Клипы 🟦\n"
-            "— Instagram Reels 📸\n"
-            "— YouTube Shorts ▶️\n\n"
-            "Можно отправлять прямые ссылки 🔗\n"
-            ".mp4 / .webm / .m3u8 / .mpd\n\n"
-            "Поделись ботом: @videodrophub_bot ✨"
-        )
-    else:
-        start_text = start_text + "\n\nYouTube Shorts ⏸️ временно выключены"
     await update.message.reply_text(start_text, parse_mode=ParseMode.HTML)
 
 
