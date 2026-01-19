@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from collections import deque
 import contextlib
 import hashlib
 import json
@@ -65,6 +66,10 @@ BOT_URL = f"https://t.me/{BOT_USERNAME}"
 GLOBAL_DOWNLOAD_SEMAPHORE: asyncio.Semaphore | None = None
 MAX_CONCURRENT_DOWNLOADS = 5
 USER_LOCKS: dict[int, asyncio.Lock] = {}
+USER_QUEUES: dict[int, deque[tuple[Update, ContextTypes.DEFAULT_TYPE, str]]] = {}
+USER_QUEUE_LOCKS: dict[int, asyncio.Lock] = {}
+USER_QUEUE_RUNNING: set[int] = set()
+MAX_USER_QUEUE_TOTAL = 3
 ACTIVE_DOWNLOADS = 0
 ACTIVE_DOWNLOADS_LOCK: asyncio.Lock | None = None
 
@@ -187,6 +192,14 @@ def _get_active_downloads_lock() -> asyncio.Lock:
     if ACTIVE_DOWNLOADS_LOCK is None:
         ACTIVE_DOWNLOADS_LOCK = asyncio.Lock()
     return ACTIVE_DOWNLOADS_LOCK
+
+
+def _get_user_queue_lock(user_id: int) -> asyncio.Lock:
+    lock = USER_QUEUE_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        USER_QUEUE_LOCKS[user_id] = lock
+    return lock
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -940,6 +953,23 @@ async def process_download(
                     await safe_cleanup(video_path)
 
 
+async def _run_user_queue(user_id: int) -> None:
+    try:
+        while True:
+            queue_lock = _get_user_queue_lock(user_id)
+            async with queue_lock:
+                q = USER_QUEUES.get(user_id)
+                if not q:
+                    USER_QUEUES.pop(user_id, None)
+                    USER_QUEUE_LOCKS.pop(user_id, None)
+                    return
+                update, context, url = q.popleft()
+
+            await process_download(update=update, context=context, user_id=user_id, url=url)
+    finally:
+        USER_QUEUE_RUNNING.discard(user_id)
+
+
 async def safe_cleanup(path: Path) -> None:
     try:
         if path.exists():
@@ -1406,15 +1436,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     user_id = update.effective_user.id
-    user_lock = USER_LOCKS.get(user_id)
-    if user_lock is None:
-        user_lock = asyncio.Lock()
-        USER_LOCKS[user_id] = user_lock
-
-    if user_lock.locked():
-        await update.message.reply_text("У тебя уже идёт загрузка. Подожди, пожалуйста.")
-        return
-
     if GLOBAL_DOWNLOAD_SEMAPHORE is None:
         await update.message.reply_text("Бот ещё запускается, попробуй через пару секунд.")
         return
@@ -1424,7 +1445,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(validation_error)
         return
 
-    await process_download(update=update, context=context, user_id=user_id, url=url)
+    queue_lock = _get_user_queue_lock(user_id)
+    start_runner = False
+    queued_pos = None
+    is_full = False
+
+    async with queue_lock:
+        q = USER_QUEUES.get(user_id)
+        if q is None:
+            q = deque()
+            USER_QUEUES[user_id] = q
+
+        running = user_id in USER_QUEUE_RUNNING
+        in_system = len(q) + (1 if running else 0)
+        if in_system >= int(MAX_USER_QUEUE_TOTAL):
+            is_full = True
+        else:
+            q.append((update, context, url))
+            if running:
+                queued_pos = len(q) + 1
+            else:
+                USER_QUEUE_RUNNING.add(user_id)
+                start_runner = True
+
+    if is_full:
+        await update.message.reply_text(
+            f"Очередь полная ({MAX_USER_QUEUE_TOTAL}/{MAX_USER_QUEUE_TOTAL}). Дождись завершения текущих загрузок."
+        )
+        return
+
+    if queued_pos is not None:
+        await update.message.reply_text(f"Поставил в очередь: {queued_pos}/{MAX_USER_QUEUE_TOTAL}. Скачаю по порядку.")
+        return
+
+    if start_runner:
+        asyncio.create_task(_run_user_queue(user_id))
+        return
 
 
 def main() -> None:
